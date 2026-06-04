@@ -1,0 +1,117 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME  = 'jenkins-demo'
+        IMAGE_TAG   = "v${env.BUILD_NUMBER}"
+        K8S_NS      = 'jenkins-demo'
+	KUBECONFIG  = credentials('kubeconfig')  // Jenkins 中配置的凭据 ID
+    }
+
+    stages {
+        stage('环境准备') {
+            steps {
+                echo '===== 检查并安装部署工具 ====='
+                script {
+                    // 安装 kubectl（如果不存在）
+		    sh '''
+                        if ! command -v kubectl &> /dev/null; then
+			    cp /opt/kube/bin/kubectl /usr/local/bin/ 2>/dev/null || true
+                        fi
+                    '''
+                    // 安装 ctr（containerd CLI，从宿主机复制）
+                    sh '''
+                        if ! command -v ctr &> /dev/null; then
+                            cp /opt/kube/bin/ctr /usr/local/bin/ 2>/dev/null || true
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('代码检出') {
+            steps {
+                echo '===== 拉取代码 ====='
+                checkout scm
+            }
+        }
+
+        stage('Maven 构建') {
+            steps {
+                echo '===== 编译打包 ====='
+                sh 'mvn clean package -DskipTests -B'
+            }
+        }
+
+        stage('Docker 镜像构建') {
+            steps {
+                echo "===== 构建镜像 ${IMAGE_NAME}:${IMAGE_TAG} ====="
+                sh """
+                    docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:latest .
+                """
+            }
+        }
+
+        stage('导入镜像到 Containerd') {
+            steps {
+                echo '===== 将镜像导入 K8s containerd ====='
+                sh """
+                    docker save ${IMAGE_NAME}:${IMAGE_TAG} | ctr -n k8s.io images import -
+                """
+            }
+        }
+
+        stage('部署到 K8s') {
+            steps {
+                echo '===== kubectl 部署 ====='
+                sh """
+		    export KUBECONFIG=${KUBECONFIG}
+                    kubectl apply -f k8s.yaml --validate=false
+                    kubectl rollout status deployment/${IMAGE_NAME} -n ${K8S_NS} --timeout=120s
+                """
+            }
+        }
+
+        stage('验证部署') {
+            steps {
+                echo '===== 检查部署状态 ====='
+                sh """
+                    echo "--- Pods ---"
+                    kubectl get pods -n ${K8S_NS} -l app=${IMAGE_NAME}
+                    echo "--- Service ---"
+                    kubectl get svc -n ${K8S_NS}
+                    echo "--- Ingress ---"
+                    kubectl get ingress -n ${K8S_NS}
+                """
+                script {
+                    // 通过 port-forward 验证服务响应
+                    sh '''
+                        kubectl port-forward svc/jenkins-demo 8888:80 -n jenkins-demo &
+                        PF_PID=$!
+                        sleep 5
+                        echo "--- 服务响应 ---"
+                        curl -s http://localhost:8888 || echo "服务暂未就绪"
+                        echo ""
+                        curl -s http://localhost:8888/health || echo "健康检查暂未就绪"
+                        kill $PF_PID 2>/dev/null || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "部署成功！镜像版本: ${IMAGE_NAME}:${IMAGE_TAG}"
+        }
+        failure {
+            echo '部署失败，请检查日志！'
+        }
+        always {
+            echo '清理工作空间...'
+            node('') {
+                cleanWs()
+            }
+        }
+    }
+}
