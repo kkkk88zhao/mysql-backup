@@ -23,8 +23,8 @@
                  │ 采集
    ┌─────────────┼──────────────┬──────────────┬─────────────┐
    ▼             ▼              ▼              ▼             ▼
- 邮件 .161     SVN .54       GitLab .153    uag .142     ESXi (待补)
- (Postfix)    (+备.21/.44)   (+备.154)     (Tomcat)     (vCenter/ESXi)
+ 邮件 .161     SVN .54       GitLab .153    uag .142     ESXi(.244~.253)+vSphere(.66)
+ (Postfix)    (+备.21/.44)   (+备.154)     (Tomcat)     (VMware,见§3.6)
 ```
 
 ITOps 不直接轮询业务系统,而是以 **Zabbix 为统一监控采集层**,ITOps 负责:
@@ -48,7 +48,8 @@ ITOps 不直接轮询业务系统,而是以 **Zabbix 为统一监控采集层**,
 | 192.168.50.5 | proxya253i5 | Ubuntu 14.04 | Nginx 反代(EOL) | Zabbix 模板 + 可疑文件核查 |
 | 192.168.50.111 | — | — | Zabbix Server(监控源) | ITOps 对接端 |
 | 192.168.103.250 | — | Ubuntu | ITOps 平台 | 平台自身 |
-| 192.168.50.66 | — | ESXi | 虚拟化层 | Zabbix ESXi/vCenter 模板 |
+| 192.168.50.66 | — | vSphere Client(管理入口) | 虚拟化管理层 | Zabbix VMware 模板(经 vCenter 纳管 ESXi) |
+| 192.168.50.244~253 | esxi-01~10 | ESXi 主机 ×10 | 虚拟化层 | Zabbix VMware ESXi/vCenter 模板 |
 
 ---
 
@@ -97,10 +98,48 @@ ITOps 不直接轮询业务系统,而是以 **Zabbix 为统一监控采集层**,
 - Zabbix 监控项:80/443 存活、各反代后端(.143/.142/.54/.51/.70/.72/.10)连通性。
 - ITOps 修复 Agent:定期核查可疑文件、去 SSLv3、规划迁移。
 
-### 3.6 ESXi 环境(192.168.50.66)
-- ESXi 管理地址:**192.168.50.66**(已确认,主机名 `50.247esxi` 已在 Zabbix 纳管)。
-- 建议:Zabbix 通过 VMware ESXi/vCenter 模板(SOAP 443)采集 CPU/内存/存储/虚拟机状态;ITOps 可触发快照/重启虚拟机等修复动作。
-- Zabbix 只读账号(用于 ITOps 主动查询):**opsread**(已创建,见第八节凭证)。
+### 3.6 ESXi 环境(vSphere 管理 + 多台 ESXi 主机)
+
+**管理平台**
+- vSphere Client(浏览器登录)地址:**192.168.50.66**,账号 `administrator@vsphere.local`(密码见密码库,勿留明文)。
+- 说明:`.66` 是 vSphere 管理入口,本身不是被监控的 ESXi 主机;监控应面向下面各 ESXi 主机(推荐经 vCenter 统一纳管,或逐台用 VMware ESXi 模板)。
+
+**ESXi 主机清单(共 10 台)**
+| 序号 | IP | 备注 |
+|------|-----|------|
+| 1 | 192.168.50.244 | |
+| 2 | 192.168.50.245 | |
+| 3 | 192.168.50.246 | |
+| 4 | 192.168.50.247 | 主机名 `50.247esxi`,已在 Zabbix 纳管 |
+| 5 | 192.168.50.248 | |
+| 6 | 192.168.50.249 | |
+| 7 | 192.168.50.250 | |
+| 8 | 192.168.50.251 | |
+| 9 | 192.168.50.252 | |
+| 10 | 192.168.50.253 | |
+
+> 各 ESXi 主机 root 密码统一(见密码库,勿留明文)。录入 Zabbix/ITOps 凭据时建议用专用只读账号而非 root 直登;若必须用 root,仅在加密凭据库存储。
+
+**监控采集方案(Zabbix)**
+- 优先方式:**通过 vCenter(.66)用 VMware vCenter 模板**(`vmware.vcenter` 类型,SOAP 443)一次性纳管全部 ESXi 与虚拟机,比逐台 ESXi 模板更省配置、能看集群/虚拟机维度。
+- 备选方式:逐台用 **VMware ESXi 模板**(`vmware.esxi` 类型),每台填 ESXi IP + 账号 + 密码,Zabbix 经 443 拉 CPU/内存/存储/网卡/虚拟机状态。
+- 采集项建议:
+  - 主机:CPU 使用率/负载、内存使用率、整机状态(`health.state`)、运行时长、磁盘总容量/已用、网卡速率/错包
+  - 存储:datastore 容量与剩余(最容易写满,对应 P0)、HBA/路径状态
+  - 虚拟机:电源状态、CPU/内存、磁盘延迟、快照数量(快照膨胀是常见风险)
+  - 触发器的关键项:datastore 剩余 < 10%(P0)、主机断开(`status` 非 OK)、主机内存气球/ swap、VM 异常关机
+- HTTPS 证书:ESXi 默认自签,若 Zabbix 报证书错误,模板里勾选忽略 SSL 验证(或导入 ESXi CA)。
+
+**ITOps 接入**
+- Zabbix 已含 `50.247esxi` 等主机,ITOps 通过 `opsread` 主动查询(`host.get`/`problem.get`)即可覆盖 ESXi 告警。
+- 可编排的修复 Agent(示例):datastore 写满 → 自动列出并清理过期快照/孤立 vmdk;主机失联 → 经 vCenter 触发虚拟机 vMotion/重启;配合 `WEBHOOK_IP_WHITELIST` 仅放行 Zabbix。
+- 凭据:ESXi/vCenter 账号密码仅在 Zabbix 主机配置与 ITOps 凭据库以加密方式保存,**本文档不记录明文**。
+
+**待办**
+- [ ] 确认 `.66` 是 vCenter 还是单台 ESXi 管理地址(决定用 vcenter 还是 esxi 模板)。
+- [ ] 在 Zabbix 用 VMware 模板批量纳管上述 10 台(优先走 vCenter)。
+- [ ] 将 ESXi root/ vCenter 账号录入 Zabbix + ITOps 凭据库(加密)。
+- [ ] 配置 datastore 剩余、主机失联等关键触发器。
 
 ---
 
@@ -290,5 +329,5 @@ curl -s -X POST http://192.168.50.111/zabbix/api_jsonrpc.php \
 2. 在 Zabbix 建 itops_ro 账号 + Webhook 媒介,打通双向对接(第六节)。
 3. ITOps 录入 50.x 各机 SSH 凭据,导入 Zabbix 主机清单。
 4. 优先编排 P0 修复 Agent:磁盘阈值(.21/.154)、Tomcat 自启(.142)、防火墙收敛(.142)。
-5. 补 ESXi 监控模板(待地址)。
+5. 补 ESXi 监控模板:地址已确认(见 §3.6,10 台 + vSphere .66)。下一步在 Zabbix 用 VMware 模板(vCenter 优先)批量纳管并配置 datastore/主机失联触发器。
 6. 统一配置文件异地备份(当前均内网同段,无异地)。
